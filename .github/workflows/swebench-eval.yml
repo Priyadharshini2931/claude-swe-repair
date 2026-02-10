@@ -1,36 +1,141 @@
-# This is a basic workflow to help you get started with Actions
+name: SWE-bench Pro Evaluation (Gemini)
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      task_id:
+        description: "Task ID to run"
+        required: true
+        default: "internetarchive__openlibrary-c4eebe6677acc4629cb541a98d5e91311444f5d4"
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  evaluate:
     runs-on: ubuntu-latest
+    container:
+      image: manojva/openlibrary-python312:latest
+      options: --user root
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
+    env:
+      TASK_ID: ${{ github.event.inputs.task_id }}
+      PYTHONPATH: /testbed
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: gemini-1.5-pro
+
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      # ----------------------------
+      # Checkout harness repo
+      # ----------------------------
+      - name: Checkout harness repo
+        uses: actions/checkout@v4
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Prepare directories
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          mkdir -p /workspace/artifacts
+          mkdir -p /testbed
+
+      # ----------------------------
+      # Clone OpenLibrary at commit
+      # ----------------------------
+      - name: Setup OpenLibrary repository
+        shell: bash
+        run: |
+          set -e
+          COMMIT_HASH=$(echo "$TASK_ID" | rev | cut -d'-' -f1 | rev)
+          git clone https://github.com/internetarchive/openlibrary.git /testbed
+          cd /testbed
+          git checkout "$COMMIT_HASH"
+
+      # ----------------------------
+      # System dependencies
+      # ----------------------------
+      - name: Install system deps
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y \
+            build-essential \
+            libpq-dev
+
+      # ----------------------------
+      # Python runtime dependencies
+      # ----------------------------
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          cd /testbed
+          python -m pip install --upgrade pip
+          pip install \
+            pytest \
+            web.py \
+            simplejson \
+            babel \
+            python-dateutil \
+            requests \
+            psycopg2-binary \
+            Cython \
+            setuptools \
+            wheel \
+            google-generativeai \
+            google-genai
+
+      # ----------------------------
+      # Install infogami (idempotent)
+      # ----------------------------
+      - name: Install infogami
+        shell: bash
+        run: |
+          cd /opt
+          if [ ! -d infogami ]; then
+            git clone https://github.com/internetarchive/infogami.git
+          fi
+          pip install -e infogami
+
+      # ----------------------------
+      # HARD FAIL if imports broken
+      # ----------------------------
+      - name: Sanity check OpenLibrary imports
+        shell: bash
+        run: |
+          python - << 'EOF'
+          import babel
+          import simplejson
+          import web
+          import infogami
+          from infogami.infobase.tests.pytest_wildcard import Wildcard
+          print("All critical imports OK")
+          EOF
+
+      # ----------------------------
+      # Run Gemini agent (single source of truth)
+      # ----------------------------
+      - name: Run Gemini agent
+        shell: bash
+        run: |
+          python scripts/run_agent.py \
+            --task-id "$TASK_ID" \
+            --repo-path /testbed \
+            --log-path /workspace/artifacts/agent.log \
+            --prompt-log /workspace/artifacts/prompts.md \
+            --pre-log /workspace/artifacts/pre_verification.log \
+            --post-log /workspace/artifacts/post_verification.log \
+            --results /workspace/artifacts/results.json \
+            --model "$GEMINI_MODEL"
+
+      # ----------------------------
+      # Capture diff
+      # ----------------------------
+      - name: Capture code changes
+        if: always()
+        shell: bash
+        run: |
+          cd /testbed
+          git diff > /workspace/artifacts/changes.patch || true
+
+      # ----------------------------
+      # Upload artifacts
+      # ----------------------------
+      - name: Upload evaluation artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: swebench-eval-artifacts
+          path: /workspace/artifacts
